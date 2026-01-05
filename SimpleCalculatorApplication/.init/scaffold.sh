@@ -1,36 +1,90 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Non-interactive CRA scaffold per step requirements
+
 WORKSPACE="/home/kavia/workspace/code-generation/simple-calculator-40856-40905/SimpleCalculatorApplication"
-LOG=/tmp/scaffold.log
-CRA_VER_FILE=/tmp/cra_version.txt
-REACT_VERSIONS=/tmp/react_versions.txt
-cd "$WORKSPACE"
-# If package.json exists, verify it looks like a CRA app (scripts.start and react/react-dom/react-scripts dep)
-if [ -f package.json ]; then
-  node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json','utf8'));const hasCRA=!!(j.scripts&&j.scripts.start&& (j.dependencies&&(j.dependencies['react']||j.dependencies['react-dom']||j.dependencies['react-scripts'])));if(!hasCRA){console.error('package.json exists but not a CRA project');process.exit(5);}process.exit(0)" || exit 5
-  exit 0
-fi
-# Determine whether to use global create-react-app or npx; record global CRA version if present
-USE_NPX=0
-if command -v create-react-app >/dev/null 2>&1; then
-  CRA_VER=$(create-react-app --version 2>/dev/null || true)
-  echo "${CRA_VER}" > "$CRA_VER_FILE" 2>&1 || true
-  CRA_MAJOR=$(echo "$CRA_VER" | cut -d'.' -f1 || echo 0)
-  if [ -z "$CRA_MAJOR" ] || ! echo "$CRA_MAJOR" | grep -Eq '^[0-9]+' || [ "$CRA_MAJOR" -lt 5 ]; then
-    USE_NPX=1
-  fi
-else
-  USE_NPX=1
-fi
-# Run CRA non-interactively and capture logs
-if [ "$USE_NPX" -eq 1 ]; then
-  npx --yes create-react-app@latest . --use-npm > "$LOG" 2>&1 || { cat "$LOG" >&2; exit 6; }
-else
-  create-react-app . --use-npm > "$LOG" 2>&1 || { cat "$LOG" >&2; exit 7; }
-fi
-# Ensure minimal start/build scripts exist in package.json
-node -e "const fs=require('fs');const p='package.json';let j=JSON.parse(fs.readFileSync(p));j.scripts=j.scripts||{};j.scripts.start=j.scripts.start||'react-scripts start';j.scripts.build=j.scripts.build||'react-scripts build';fs.writeFileSync(p,JSON.stringify(j,null,2))"
-# record installed react version if any
-node -e "try{const p=require('./package.json');console.log((p.dependencies&&p.dependencies.react)||'');}catch(e){}" > "$REACT_VERSIONS" 2>&1 || true
-exit 0
+mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
+[ -f package.json ] && exit 0
+cat > package.json <<'EOF'
+{
+  "name": "simple-calculator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=16" },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173",
+    "start": "vite preview --port 5173",
+    "test": "vitest run --reporter=dot"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "vitest": "^1.0.0",
+    "@vitejs/plugin-react": "^4.0.0"
+  }
+}
+EOF
+
+mkdir -p src
+cat > index.html <<'EOF'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Simple Calculator</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+EOF
+
+cat > src/main.jsx <<'EOF'
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+createRoot(document.getElementById('root')).render(React.createElement(App))
+EOF
+
+cat > src/App.jsx <<'EOF'
+import React from 'react'
+export default function App(){
+  const [display] = React.useState('0')
+  return (
+    React.createElement('div', {style:{fontFamily:'sans-serif',padding:20}},
+      React.createElement('h1', null, 'Simple Calculator (dev scaffold)'),
+      React.createElement('div', null, display)
+    )
+  )
+}
+EOF
+
+cat > vitest.config.js <<'EOF'
+import { defineConfig } from 'vitest/config'
+export default defineConfig({test:{globals:true,environment:'jsdom'}})
+EOF
+
+mkdir -p test
+cat > test/sample.test.js <<'EOF'
+import { describe, it, expect } from 'vitest'
+describe('sanity', ()=>{ it('works', ()=> expect(1+1).toBe(2)) })
+EOF
+
+cat > README.md <<'EOF'
+Simple Calculator - development scaffold using Vite + React
+Run locally: npm ci && npm run dev
+Logs: /tmp/simple_calculator_*.log
+EOF
+
+cat > .gitignore <<'EOF'
+node_modules/
+dist/
+.env
+EOF
