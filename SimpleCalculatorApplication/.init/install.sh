@@ -1,38 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# workspace path (from container context)
 WORKSPACE="/home/kavia/workspace/code-generation/simple-calculator-40856-40905/SimpleCalculatorApplication"
 cd "$WORKSPACE"
-
-LOG=/tmp/simple_calculator_npm_install.log
-# Keep a small audit trail header
-printf "INSTALL START: %s\n" "$(date --iso-8601=seconds)" >"${LOG}"
-
-# Ensure devDependencies are installed even with CI=true by unsetting NODE_ENV if set to production
-OLD_NODE_ENV="${NODE_ENV-}"
-if [ "${OLD_NODE_ENV}" = "production" ]; then
-  unset NODE_ENV
-fi
-
-# Run npm using package-lock.json when present; include dev deps explicitly
+ERR_EXIT(){ echo "ERROR: $1" >&2; exit ${2:-1}; }
+command -v npm >/dev/null 2>&1 || ERR_EXIT "npm missing" 2
+if [ ! -f package.json ]; then echo "no package.json found, nothing to install"; exit 0; fi
+# Decide if install needed
+DO_INSTALL=0
+if [ ! -d node_modules ] || [ "${FORCE_INSTALL:-0}" = "1" ]; then DO_INSTALL=1; fi
 if [ -f package-lock.json ]; then
-  npm ci --no-audit --no-fund --include=dev >>"${LOG}" 2>&1 || { echo "ERROR: npm ci failed, see ${LOG}" >&2; tail -n 200 "${LOG}" >&2 || true; exit 4; }
+  md5sum package-lock.json | awk '{print $1}' > .package-lock.md5.new
+  if [ -f .package-lock.md5 ]; then
+    if ! cmp -s .package-lock.md5 .package-lock.md5.new; then DO_INSTALL=1; fi
+  else
+    DO_INSTALL=1
+  fi
+  mv .package-lock.md5.new .package-lock.md5
+fi
+if [ "$DO_INSTALL" -eq 1 ]; then
+  LOG=/tmp/npm_install_log.$$
+  if [ -f package-lock.json ]; then
+    npm ci --no-audit --no-fund >"$LOG" 2>&1 || { tail -n 200 "$LOG" >&2; ERR_EXIT "npm ci failed" 10; }
+  else
+    npm install --no-audit --no-fund >"$LOG" 2>&1 || { tail -n 200 "$LOG" >&2; ERR_EXIT "npm install failed" 11; }
+  fi
 else
-  npm i --no-audit --no-fund --include=dev >>"${LOG}" 2>&1 || { echo "ERROR: npm install failed, see ${LOG}" >&2; tail -n 200 "${LOG}" >&2 || true; exit 5; }
+  echo "node_modules present and package-lock unchanged; skipping install"
 fi
-
-# restore NODE_ENV
-if [ -n "${OLD_NODE_ENV}" ]; then
-  export NODE_ENV="${OLD_NODE_ENV}"
+# Install test/dev deps only if requested to avoid changing lockfile unintentionally
+if [ "${TESTS:-0}" = "1" ] || [ "${FORCE_TEST_DEPS:-0}" = "1" ]; then
+  npm i -D @testing-library/react @testing-library/jest-dom jest --no-audit --no-fund >/tmp/npm_test_deps_log.$$ 2>&1 || { tail -n 100 /tmp/npm_test_deps_log.$$ >&2; echo "warning: installing test deps failed" >&2; }
 fi
-
-# Basic validations
-[ -d node_modules ] || { echo "ERROR: node_modules not present" >&2; tail -n 200 "${LOG}" >&2 || true; exit 8; }
-[ -x node_modules/.bin/vite ] || { echo "ERROR: vite binary missing or not executable" >&2; tail -n 200 "${LOG}" >&2 || true; exit 6; }
-[ -x node_modules/.bin/vitest ] || { echo "ERROR: vitest binary missing or not executable" >&2; tail -n 200 "${LOG}" >&2 || true; exit 7; }
-
-printf "INSTALL SUCCESS: %s\n" "$(date --iso-8601=seconds)" >>"${LOG}"
-
-# Print short summary to stdout for the operator
-echo "Dependencies installed. Logs: ${LOG}"

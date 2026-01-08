@@ -1,106 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Validation: build, preview, readiness poll, capture evidence, cleanup
+# validation: serve production build and verify HTTP responses
 WORKSPACE="/home/kavia/workspace/code-generation/simple-calculator-40856-40905/SimpleCalculatorApplication"
-cd "${WORKSPACE}"
-export CI=true
-
-BUILD_LOG="/tmp/simple_calculator_build.log"
-PREVIEW_LOG="/tmp/simple_calculator_preview.log"
-EVIDENCE_PREFIX="/tmp/simple_calculator_evidence"
-STATUS_FILE="/tmp/simple_calculator_status.txt"
-PORT=5173
-READINESS_TIMEOUT=60
-
-# Ensure evidence directory (prefix uses /tmp so nothing to create beyond confirming)
-: > "${BUILD_LOG}"
-: > "${PREVIEW_LOG}"
-
-# Build using local vite binary if available, otherwise fallback to npm run build
-if [ -x "${WORKSPACE}/node_modules/.bin/vite" ]; then
-  "${WORKSPACE}/node_modules/.bin/vite" build >"${BUILD_LOG}" 2>&1 || { echo "ERROR: build failed, see ${BUILD_LOG}" >&2; tail -n 200 "${BUILD_LOG}" >&2; exit 12; }
+cd "$WORKSPACE"
+ERR_EXIT(){ echo "ERROR: $1" >&2; exit ${2:-1}; }
+export HOST=0.0.0.0 PORT=${PORT:-3000}
+# Build must exist
+[ -d build ] || ERR_EXIT "build directory not found; run build step first" 40
+LOGFILE=$(mktemp /tmp/simple_calc_srvlog.XXXX)
+# Start server in its own process group; prefer local http-server
+if [ -x "./node_modules/.bin/http-server" ]; then
+  setsid ./node_modules/.bin/http-server build -p "$PORT" -a 0.0.0.0 >"$LOGFILE" 2>&1 &
+  PID=$!
+elif command -v npx >/dev/null 2>&1 && command -v http-server >/dev/null 2>&1; then
+  setsid npx http-server build -p "$PORT" -a 0.0.0.0 >"$LOGFILE" 2>&1 &
+  PID=$!
 else
-  # Try npm run build (assumes script exists)
-  npm run build >"${BUILD_LOG}" 2>&1 || { echo "ERROR: build failed (npm run build), see ${BUILD_LOG}" >&2; tail -n 200 "${BUILD_LOG}" >&2; exit 13; }
+  setsid python3 -m http.server "$PORT" --directory build >"$LOGFILE" 2>&1 &
+  PID=$!
 fi
-
-# Verify preview binary
-PREVIEW_BIN="${WORKSPACE}/node_modules/.bin/vite"
-if [ ! -x "${PREVIEW_BIN}" ]; then
-  echo "ERROR: preview binary missing at ${PREVIEW_BIN}" >&2
-  exit 14
-fi
-
-# Prepare to start preview
-PREVIEW_CMD=("${PREVIEW_BIN}" preview "--port" "${PORT}" "--strictPort")
-
-# Start preview in background and capture PID
-"${PREVIEW_CMD[@]}" >"${PREVIEW_LOG}" 2>&1 &
-PREVIEW_PID=$!
-
-# Trap-based cleanup to ensure preview is stopped
-_cleanup() {
-  rc=$?
-  if [ -n "${PREVIEW_PID:-}" ]; then
-    kill "${PREVIEW_PID}" >/dev/null 2>&1 || true
-    wait "${PREVIEW_PID}" 2>/dev/null || true
+# Ensure cleanup of process group and logfile
+trap 'pgid=$(ps -o pgid= "$PID" | tr -d " "); [ -n "$pgid" ] && kill -TERM -"$pgid" >/dev/null 2>&1 || true; rm -f "$LOGFILE"' EXIT
+# Poll localhost and 127.0.0.1 for up to MAX_WAIT seconds
+MAX_WAIT=120
+SLEEP=2
+WAITED=0
+while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+  if curl -sSf "http://127.0.0.1:$PORT" >/dev/null 2>&1 || curl -sSf "http://localhost:$PORT" >/dev/null 2>&1; then
+    echo "validation: server responded"
+    break
   fi
-  exit ${rc}
-}
-trap _cleanup EXIT
-
-# Poll for HTTP readiness
-start_time=$(date +%s)
-end_time=$((start_time + READINESS_TIMEOUT))
-ready=0
-while [ $(date +%s) -le ${end_time} ]; do
-  # Use curl with low timeouts to avoid hangs
-  http_code=$(curl -sS --max-time 2 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/" || true)
-  case "${http_code}" in
-    2??|3??)
-      ready=1; break;;
-    *)
-      sleep 1;;
-  esac
+  sleep $SLEEP
+  WAITED=$((WAITED+SLEEP))
 done
-
-if [ "${ready}" -ne 1 ]; then
-  echo "ERROR: preview server did not respond with 2xx/3xx within ${READINESS_TIMEOUT}s" >&2
-  echo "--- last ${PREVIEW_LOG} ---" >&2
-  tail -n 200 "${PREVIEW_LOG}" >&2 || true
-  exit 15
+if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+  echo "validation failed: server did not respond within ${MAX_WAIT}s" >&2
+  echo "---- last log lines ----" >&2
+  tail -n 200 "$LOGFILE" >&2 || true
+  ERR_EXIT "validation timeout" 41
 fi
-
-# Capture evidence reliably using the prefix
-EVIDENCE_HEADERS="${EVIDENCE_PREFIX}_headers.txt"
-EVIDENCE_BODY="${EVIDENCE_PREFIX}_body.html"
-EVIDENCE_SUMMARY="${EVIDENCE_PREFIX}_summary.txt"
-EVIDENCE_SNIPPET="${EVIDENCE_PREFIX}_snippet.html"
-
-# Fetch headers and body (with timeouts)
-curl -sS --max-time 5 -D "${EVIDENCE_HEADERS}" "http://127.0.0.1:${PORT}/" -o "${EVIDENCE_BODY}" 2>/dev/null || true
-STATUS=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/" || echo "000")
-
-echo "status:${STATUS}" > "${EVIDENCE_SUMMARY}"
-# Append first portion of headers to summary
-if [ -f "${EVIDENCE_HEADERS}" ]; then
-  head -n 200 "${EVIDENCE_HEADERS}" >> "${EVIDENCE_SUMMARY}" || true
-fi
-# Create a short snippet of body
-if [ -f "${EVIDENCE_BODY}" ]; then
-  head -n 50 "${EVIDENCE_BODY}" > "${EVIDENCE_SNIPPET}" || true
-fi
-
-# Mark success
-echo "validation_success" > "${STATUS_FILE}"
-
-# Cleanup: kill preview if still running (trap will also handle)
-if ps -p "${PREVIEW_PID}" > /dev/null 2>&1; then
-  kill "${PREVIEW_PID}" >/dev/null 2>&1 || true
-  wait "${PREVIEW_PID}" 2>/dev/null || true
-fi
-
-# Remove trap and exit 0
-trap - EXIT
-exit 0
+# Clean shutdown of process group
+pgid=$(ps -o pgid= "$PID" | tr -d " ")
+if [ -n "$pgid" ]; then kill -TERM -"$pgid" >/dev/null 2>&1 || true; fi
+wait "$PID" 2>/dev/null || true
+rm -f "$LOGFILE"
+echo "validation: success"
