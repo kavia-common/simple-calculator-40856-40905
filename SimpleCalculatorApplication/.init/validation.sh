@@ -1,47 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# validation: serve production build and verify HTTP responses
+# build-run-and-validate-static
 WORKSPACE="/home/kavia/workspace/code-generation/simple-calculator-40856-40905/SimpleCalculatorApplication"
 cd "$WORKSPACE"
-ERR_EXIT(){ echo "ERROR: $1" >&2; exit ${2:-1}; }
-export HOST=0.0.0.0 PORT=${PORT:-3000}
-# Build must exist
-[ -d build ] || ERR_EXIT "build directory not found; run build step first" 40
-LOGFILE=$(mktemp /tmp/simple_calc_srvlog.XXXX)
-# Start server in its own process group; prefer local http-server
-if [ -x "./node_modules/.bin/http-server" ]; then
-  setsid ./node_modules/.bin/http-server build -p "$PORT" -a 0.0.0.0 >"$LOGFILE" 2>&1 &
-  PID=$!
-elif command -v npx >/dev/null 2>&1 && command -v http-server >/dev/null 2>&1; then
-  setsid npx http-server build -p "$PORT" -a 0.0.0.0 >"$LOGFILE" 2>&1 &
-  PID=$!
-else
-  setsid python3 -m http.server "$PORT" --directory build >"$LOGFILE" 2>&1 &
-  PID=$!
+export CI=true
+LOG="$WORKSPACE/.build_and_serve.log"
+PIDFILE="$WORKSPACE/.serve.pid"
+SERVELOG="$WORKSPACE/.serve.log"
+# ensure cleanup: kill exact PID if present
+cleanup(){ rc=$?; if [ -f "$PIDFILE" ]; then PID=$(cat "$PIDFILE" 2>/dev/null || true); if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then kill "$PID" >/dev/null 2>&1 || true; fi; rm -f "$PIDFILE"; fi; exit "$rc"; }
+trap cleanup EXIT
+# Build (capture logs)
+npm run build --silent >"$LOG" 2>&1 || { echo "build failed - see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 9; }
+[ -d "$WORKSPACE/build" ] || { echo "build directory missing" >&2; exit 10; }
+# write lightweight static server
+cat > "$WORKSPACE/serve.js" <<'NODE'
+const http = require('http'), fs = require('fs'), path = require('path'); const buildDir=path.join(process.cwd(),'build'); const port=process.env.PORT||3000; const mime={'.html':'text/html','.js':'application/javascript','.css':'text/css','.json':'application/json','.png':'image/png','.jpg':'image/jpeg','.svg':'image/svg+xml','.ico':'image/x-icon'}; http.createServer((req,res)=>{ let reqPath=req.url.split('?')[0]; if(reqPath==='/' ) reqPath='/index.html'; const file=path.join(buildDir,decodeURIComponent(reqPath)); fs.readFile(file,(err,data)=>{ if(err){ res.statusCode=404; res.end('Not found'); return;} const ext=path.extname(file); res.setHeader('Content-Type', mime[ext]||'application/octet-stream'); res.end(data); }); }).listen(port,()=>console.log('serve.js listening',port));
+NODE
+# start server in background and capture PID
+nohup node serve.js >"$SERVELOG" 2>&1 &
+PID=$!
+echo "$PID" >"$PIDFILE"
+# quick sanity check the PID is running and is node
+sleep 0.5
+if ! ps -p "$PID" >/dev/null 2>&1 || ! ps -p "$PID" -o comm= | grep -qi node >/dev/null 2>&1; then
+  echo "failed to start node server (pid $PID)" >&2
+  tail -n 200 "$SERVELOG" >&2 || true
+  exit 11
 fi
-# Ensure cleanup of process group and logfile
-trap 'pgid=$(ps -o pgid= "$PID" | tr -d " "); [ -n "$pgid" ] && kill -TERM -"$pgid" >/dev/null 2>&1 || true; rm -f "$LOGFILE"' EXIT
-# Poll localhost and 127.0.0.1 for up to MAX_WAIT seconds
-MAX_WAIT=120
-SLEEP=2
-WAITED=0
-while [ "$WAITED" -lt "$MAX_WAIT" ]; do
-  if curl -sSf "http://127.0.0.1:$PORT" >/dev/null 2>&1 || curl -sSf "http://localhost:$PORT" >/dev/null 2>&1; then
-    echo "validation: server responded"
-    break
-  fi
-  sleep $SLEEP
-  WAITED=$((WAITED+SLEEP))
+# Poll for HTTP 200
+MAX_WAIT=60
+i=0
+SUCCESS=1
+while [ $i -lt $MAX_WAIT ]; do
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/ || true)
+  if [ "$HTTP_CODE" = "200" ]; then SUCCESS=0; break; fi
+  sleep 1; i=$((i+1))
 done
-if [ "$WAITED" -ge "$MAX_WAIT" ]; then
-  echo "validation failed: server did not respond within ${MAX_WAIT}s" >&2
-  echo "---- last log lines ----" >&2
-  tail -n 200 "$LOGFILE" >&2 || true
-  ERR_EXIT "validation timeout" 41
+if [ $SUCCESS -ne 0 ]; then
+  echo "static server did not respond in time" >&2
+  tail -n 200 "$SERVELOG" >&2 || true
+  exit 12
 fi
-# Clean shutdown of process group
-pgid=$(ps -o pgid= "$PID" | tr -d " ")
-if [ -n "$pgid" ]; then kill -TERM -"$pgid" >/dev/null 2>&1 || true; fi
-wait "$PID" 2>/dev/null || true
-rm -f "$LOGFILE"
-echo "validation: success"
+# Evidence
+echo "server_response_code=200"
+echo "build_exists=yes"
+du -sh build 2>/dev/null || true
+ls -l build | head -n 20 || true
+tail -n 100 "$SERVELOG" || true
+# normal exit (trap will cleanup)
+exit 0
